@@ -1,0 +1,184 @@
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
+
+struct PriceData {
+    timestamp: u64,
+    price: f64,
+}
+
+struct TradingBot {
+    listen_balance: f64,
+    sol_balance: f64,
+    prices: VecDeque<PriceData>,
+    ema_12: f64,
+    ema_21: f64,
+    last_trade_time: u64,
+    trade_size: f64,
+    last_buy_price: Option<f64>,
+    last_sell_price: Option<f64>,
+    stop_loss_percent: f64,
+}
+
+impl TradingBot {
+    fn new(initial_sol: f64) -> Self {
+        TradingBot {
+            listen_balance: 0.0,
+            sol_balance: initial_sol,
+            prices: VecDeque::new(),
+            ema_12: 0.0,
+            ema_21: 0.0,
+            last_trade_time: 0,
+            trade_size: initial_sol * 0.1,
+            last_buy_price: None,
+            last_sell_price: None,
+            stop_loss_percent: 0.12, // 12% stop loss
+        }
+    }
+
+    fn calculate_ema(&self, prices: &[f64], period: usize) -> f64 {
+        if prices.len() < period {
+            return 0.0;
+        }
+        let k = 2.0 / (period as f64 + 1.0);
+        let mut ema = prices[0];
+        for &price in prices.iter().skip(1) {
+            ema = (price * k) + (ema * (1.0 - k));
+        }
+        ema
+    }
+
+    fn calculate_fibonacci_levels(&self, high: f64, low: f64) -> Vec<f64> {
+        let diff = high - low;
+        vec![
+            high, // 1.0
+            high - (diff * 0.75), // Priority level
+            high - (diff * 0.618),  
+            high - (diff * 0.5),
+            high - (diff * 0.382),
+            high - (diff * 0.25), // Priority level
+            low, // 0.0
+        ]
+    }
+
+    fn update_price(&mut self, price: f64) {
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        self.prices.push_back(PriceData { timestamp, price });
+        while self.prices.len() > 21 {
+            self.prices.pop_front();
+        }
+
+        let price_vec: Vec<f64> = self.prices.iter().map(|p| p.price).collect();
+        if price_vec.len() >= 21 {
+            self.ema_12 = self.calculate_ema(&price_vec, 12);
+            self.ema_21 = self.calculate_ema(&price_vec, 21);
+        }
+    }
+
+    fn execute_trade(&mut self, current_price: f64, is_buy: bool) {
+        let fee = 0.001;
+        
+        if is_buy {
+            let listen_amount = (self.trade_size / current_price) * (1.0 - fee);
+            if self.sol_balance >= self.trade_size {
+                self.sol_balance -= self.trade_size;
+                self.listen_balance += listen_amount;
+                self.last_buy_price = Some(current_price);
+                self.last_sell_price = None;
+                println!("Bought {} $LISTEN at {}", listen_amount, current_price);
+            }
+        } else {
+            let sol_amount = (self.trade_size * current_price) * (1.0 - fee);
+            if self.listen_balance >= self.trade_size {
+                self.listen_balance -= self.trade_size;
+                self.sol_balance += sol_amount;
+                self.last_sell_price = Some(current_price);
+                self.last_buy_price = None;
+                println!("Sold {} $LISTEN at {}", self.trade_size, current_price);
+            }
+        }
+        
+        self.last_trade_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+    }
+
+    fn check_stop_loss(&mut self, current_price: f64) {
+        if let Some(buy_price) = self.last_buy_price {
+            if current_price <= buy_price * (1.0 - self.stop_loss_percent) {
+                self.execute_trade(current_price, false);
+                println!("Stop loss triggered: Sold at {} (bought at {})", current_price, buy_price);
+            }
+        }
+        if let Some(sell_price) = self.last_sell_price {
+            if current_price >= sell_price * (1.0 + self.stop_loss_percent) {
+                self.execute_trade(current_price, true);
+                println!("Stop loss triggered: Bought at {} (sold at {})", current_price, sell_price);
+            }
+        }
+    }
+
+    fn trade(&mut self, current_price: f64) {
+        self.update_price(current_price);
+
+        if self.prices.len() < 21 || self.ema_12 == 0.0 || self.ema_21 == 0.0 {
+            return;
+        }
+
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if current_time - self.last_trade_time < 4 * 60 * 60 {
+            return;
+        }
+
+        let prices: Vec<f64> = self.prices.iter().map(|p| p.price).collect();
+        let high = prices.iter().fold(f64::MIN, |a, &b| a.max(b));
+        let low = prices.iter().fold(f64::MAX, |a, &b| a.min(b));
+        let fib_levels = self.calculate_fibonacci_levels(high, low);
+
+        // Check stop loss first
+        self.check_stop_loss(current_price);
+
+        let prev_ema_12 = self.calculate_ema(&prices[0..prices.len()-1], 12);
+        let prev_ema_21 = self.calculate_ema(&prices[0..prices.len()-1], 21);
+        let ema_cross_up = prev_ema_12 <= prev_ema_21 && self.ema_12 > self.ema_21;
+        let ema_cross_down = prev_ema_12 >= prev_ema_21 && self.ema_12 < self.ema_21;
+
+        // Primary signals from priority Fib levels (0.25 and 0.75)
+        let fib_25 = fib_levels[5]; // 0.25 level
+        let fib_75 = fib_levels[1]; // 0.75 level
+
+        // Buy logic: Price near 0.25 Fib with EMA validation
+        if current_price <= fib_25 * 1.01 && current_price >= fib_25 * 0.99 {
+            if ema_cross_up || self.ema_12 > self.ema_21 {
+                self.execute_trade(current_price, true);
+            }
+        }
+
+        // Sell logic: Price near 0.75 Fib with EMA validation
+        if current_price <= fib_75 * 1.01 && current_price >= fib_75 * 0.99 {
+            if ema_cross_down || self.ema_12 < self.ema_21 {
+                self.execute_trade(current_price, false);
+            }
+        }
+    }
+}
+
+fn main() {
+    let mut bot = TradingBot::new(10.0);
+    
+    let mut simulated_price = 0.1;
+    loop {
+        bot.trade(simulated_price);
+        println!("SOL: {}, LISTEN: {}", bot.sol_balance, bot.listen_balance);
+        
+        simulated_price += (rand::random::<f64>() - 0.5) * 0.01;
+        std::thread::sleep(Duration::from_secs(60 * 60 * 4));
+    }
+}
